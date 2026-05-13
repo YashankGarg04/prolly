@@ -1,276 +1,238 @@
-// Find NEAR documentation at https://docs.near.org
-use near_sdk::json_types::U64;
-use near_sdk::{AccountId, NearToken, PanicOnDefault, Promise, Timestamp, env, near, require};
+use near_sdk::{env, near, AccountId, Promise, PanicOnDefault, NearToken};
+use near_sdk::json_types::U128;
+use std::collections::HashMap;
 
-// Define the contract structure
-#[near(contract_state)]
-#[derive(PanicOnDefault)] // The contract is required to be initialized with `#[init]` functions
-pub struct Contract {
-    highest_bid: Bid,
-    auction_end_time: Timestamp,
-    auctioneer: AccountId,
-    is_claimed: bool,
+// 1. The Strict State Machine
+#[near(serializers = [borsh, json])]
+#[derive(Clone, PartialEq)]
+pub enum GameState {
+    Active,
+    Drawing,
+    Concluded,
+    Complete,
+    Refunded,
 }
 
-// The Bid structure is used as function return value (JSON-serialized) and as part of the Contract
-// state (Borsh-serialized)
-#[near(serializers = [json, borsh])]
+// 2. The Game Structure (Allows multiple simultaneous games)
+#[near(serializers = [borsh, json])]
 #[derive(Clone)]
-pub struct Bid {
-    pub bidder: AccountId,
-    pub bid: NearToken,
+pub struct Game {
+    pub id: u64,
+    pub state: GameState,
+    pub entry_fee: NearToken,
+    pub processing_fee: NearToken,
+    pub n_variable: u64, 
+    pub max_multiplier: u8,
+    pub participants: Vec<AccountId>,
+    pub multipliers: HashMap<AccountId, u8>, 
+    pub total_tickets: u64, 
 }
 
-// Implement the contract functions
+#[near(contract_state)]
+#[derive(PanicOnDefault)]
+pub struct ProllyFactory {
+    pub owner_id: AccountId,
+    pub stakeholders: Vec<AccountId>,
+    pub games: HashMap<u64, Game>,
+    pub next_game_id: u64,
+    pub banned_users: Vec<AccountId>, // NEW: Global ban list
+}
+
 #[near]
-impl Contract {
-    /// Initializer function that one must call after the contract code is deployed to an account
-    /// for the first time, all other functions will fail to execute until the contract state is
-    /// initialized (thanks to PanicOnDefault derive above).
-    /// It is common to batch contract initialization in the same transaction as contract deployment.
-    /// Sometimes #[private] attribute can also be useful to guard the function to be callable only
-    /// by the account where the contract is deployed to.
+impl ProllyFactory {
     #[init]
-    pub fn init(end_time: U64, auctioneer: AccountId) -> Self {
+    pub fn new(stakeholders: Vec<AccountId>) -> Self {
+        assert!(!env::state_exists(), "Already initialized");
         Self {
-            highest_bid: Bid {
-                bidder: env::current_account_id(),
-                bid: NearToken::from_yoctonear(1),
-            },
-            auction_end_time: end_time.into(),
-            is_claimed: false,
-            auctioneer,
+            owner_id: env::predecessor_account_id(),
+            stakeholders,
+            games: HashMap::new(),
+            next_game_id: 1,
+            banned_users: Vec::new(), // NEW: Initialize the ban list
         }
     }
 
-    /// Bid function can be called by any account on blockchain to make a higher bid on the auction
+    // ==========================================
+    // --- SECURITY & ADMIN CONTROLS ---
+    // ==========================================
+
+    pub fn add_stakeholder(&mut self, account_id: AccountId) {
+        assert_eq!(env::predecessor_account_id(), self.owner_id, "Only owner can manage stakeholders");
+        assert!(!self.stakeholders.contains(&account_id), "User is already a stakeholder");
+        self.stakeholders.push(account_id);
+    }
+
+    pub fn remove_stakeholder(&mut self, account_id: AccountId) {
+        assert_eq!(env::predecessor_account_id(), self.owner_id, "Only owner can manage stakeholders");
+        self.stakeholders.retain(|x| x != &account_id);
+    }
+
+    pub fn ban_user(&mut self, account_id: AccountId) {
+        assert_eq!(env::predecessor_account_id(), self.owner_id, "Only owner can ban users");
+        assert!(account_id != self.owner_id, "Admin cannot ban themselves");
+        assert!(!self.banned_users.contains(&account_id), "User is already banned");
+        self.banned_users.push(account_id);
+    }
+
+    pub fn unban_user(&mut self, account_id: AccountId) {
+        assert_eq!(env::predecessor_account_id(), self.owner_id, "Only owner can unban users");
+        self.banned_users.retain(|x| x != &account_id);
+    }
+
+
+    // ==========================================
+    // --- GAME MANAGEMENT FUNCTIONS ---
+    // ==========================================
+
+    // Admin creates a new game with specific rules
+    pub fn create_game(&mut self, entry_fee_yocto: U128, processing_fee_yocto: U128, n_variable: u64, max_multiplier: u8) -> u64 {
+        assert_eq!(env::predecessor_account_id(), self.owner_id, "Only owner can create games");
+        assert!(n_variable > max_multiplier as u64, "N must be larger than the max multiplier");
+
+        let game_id = self.next_game_id;
+        let new_game = Game {
+            id: game_id,
+            state: GameState::Active,
+            entry_fee: NearToken::from_yoctonear(entry_fee_yocto.0),
+            processing_fee: NearToken::from_yoctonear(processing_fee_yocto.0),
+            n_variable,
+            max_multiplier,
+            participants: Vec::new(),
+            multipliers: HashMap::new(),
+            total_tickets: 0,
+        };
+
+        self.games.insert(game_id, new_game);
+        self.next_game_id += 1;
+        game_id
+    }
+
+    // Stakeholders trigger the draw (Locks state to prevent new entries or refunds)
+    pub fn trigger_conclude(&mut self, game_id: u64) {
+        let caller = env::predecessor_account_id();
+        assert!(self.stakeholders.contains(&caller) || caller == self.owner_id, "Unauthorized");
+        
+        let game = self.games.get_mut(&game_id).expect("Game not found");
+        assert!(game.state == GameState::Active, "Game must be Active to conclude");
+        assert!(game.participants.len() > 0, "No players joined. Use refund instead.");
+
+        // Lock the game state to Drawing!
+        game.state = GameState::Drawing;
+
+        // NOTE: In the final Mainnet version, this is where you call the NEAR Randomness Beacon.
+        // For this architecture test, we will simulate the callback succeeding immediately.
+        self.internal_resolve_winners(game_id);
+    }
+
+    // Admin emergency force closure
+    pub fn refund_game(&mut self, game_id: u64) {
+        let caller = env::predecessor_account_id();
+        assert!(self.stakeholders.contains(&caller) || caller == self.owner_id, "Unauthorized");
+
+        let game = self.games.get_mut(&game_id).expect("Game not found");
+        // Strict State Overlap Protection
+        assert!(game.state == GameState::Active, "Can only refund an Active game");
+
+        game.state = GameState::Refunded;
+
+        for player in &game.participants {
+            let mult = *game.multipliers.get(player).unwrap() as u128;
+            let refund_amount = game.entry_fee.saturating_mul(mult);
+            Promise::new(player.clone()).transfer(refund_amount).detach();
+        }
+    }
+
+    // Admin cleans up the database after frontend saves it
+    pub fn complete_game_cleanup(&mut self, game_id: u64) {
+        assert_eq!(env::predecessor_account_id(), self.owner_id, "Only owner can cleanup");
+        let game = self.games.get_mut(&game_id).expect("Game not found");
+        assert!(game.state == GameState::Concluded, "Game must be Concluded to cleanup");
+
+        // Delete the heavy arrays to get our storage deposit back!
+        game.participants.clear();
+        game.multipliers.clear();
+        game.state = GameState::Complete;
+    }
+
+
+    // ==========================================
+    // --- PLAYER FUNCTIONS ---
+    // ==========================================
+
     #[payable]
-    pub fn bid(&mut self) -> Promise {
-        // Assert the auction is still ongoing
-        require!(
-            env::block_timestamp() < self.auction_end_time,
-            "Auction has ended"
-        );
+    pub fn join_game(&mut self, game_id: u64, multiplier: u8) {
+        let player = env::predecessor_account_id();
+        
+        // NEW SECURITY CHECKS: Ban list and House block
+        assert!(!self.banned_users.contains(&player), "You are banned from participating in Prolly");
+        assert!(!self.stakeholders.contains(&player) && player != self.owner_id, "Stakeholders and the Admin cannot participate in games");
 
-        // Current bid
-        let bid = env::attached_deposit();
-        let bidder = env::predecessor_account_id();
+        let game = self.games.get_mut(&game_id).expect("Game not found");
+        assert!(game.state == GameState::Active, "This game is not Active");
+        assert!(multiplier >= 1 && multiplier <= game.max_multiplier, "Invalid multiplier");
+        assert!(!game.multipliers.contains_key(&player), "You can only join once per game");
 
-        // Last bid recorded by the contract
-        let Bid {
-            bidder: last_bidder,
-            bid: last_bid,
-        } = self.highest_bid.clone();
+        // Math: (Entry Fee * Multiplier) + Processing Fee
+        let required_entry = game.entry_fee.saturating_mul(multiplier as u128);
+        let total_required = required_entry.saturating_add(game.processing_fee);
+        
+        assert_eq!(env::attached_deposit(), total_required, "Incorrect deposit attached");
 
-        // Check if the deposit is higher than the current bid
-        require!(bid > last_bid, "You must place a higher bid");
+        // Send processing fee directly to House (Admin) immediately
+        Promise::new(self.owner_id.clone()).transfer(game.processing_fee).detach();
 
-        // Update the highest bid
-        self.highest_bid = Bid { bidder, bid };
-
-        // Transfer tokens back to the last bidder.
-        //
-        // NOTE: The result of this Promise is not handled. If this transfer fails (for example,
-        // because `last_bidder` account was removed), the previous bidder may not be refunded even
-        // though `self.highest_bid` has already been updated. For production use, consider
-        // implementing a withdrawal pattern or adding a callback to handle transfer failures.
-        Promise::new(last_bidder).transfer(last_bid)
+        game.participants.push(player.clone());
+        game.multipliers.insert(player, multiplier);
+        game.total_tickets += multiplier as u64;
     }
 
-    /// Claim function can be called by any account on blockchain to claim the auction and transfer
-    /// the tokens to the auctioneer
-    pub fn claim(&mut self) -> Promise {
-        // Assert the auction has ended
-        require!(
-            env::block_timestamp() > self.auction_end_time,
-            "Auction has not ended yet"
-        );
 
-        // Assert the auction has not been claimed yet
-        require!(!self.is_claimed, "Auction has already been claimed");
-        self.is_claimed = true;
+    // ==========================================
+    // --- INTERNAL LOGIC ---
+    // ==========================================
 
-        // Transfer tokens to the auctioneer.
-        //
-        // NOTE: The result of this Promise is not handled. If this transfer fails (for example,
-        // because `last_bidder` account was removed), the previous bidder may not be refunded even
-        // though `self.highest_bid` has already been updated. For production use, consider
-        // implementing a withdrawal pattern or adding a callback to handle transfer failures.
-        Promise::new(self.auctioneer.clone()).transfer(self.highest_bid.bid)
+    // This simulates the callback from the Randomness Beacon
+    fn internal_resolve_winners(&mut self, game_id: u64) {
+        let game = self.games.get_mut(&game_id).unwrap();
+        
+        // 1 <= Winners <= Total / N
+        let calculated_winners = game.total_tickets / game.n_variable;
+        let num_winners = std::cmp::max(1, calculated_winners);
+
+        let total_prize_pool = game.entry_fee.saturating_mul(game.total_tickets as u128);
+        let reward_per_winner = total_prize_pool.saturating_div(num_winners as u128);
+
+        // Simulated Randomness
+        let random_seed = env::random_seed();
+        let mut rand_val = u64::from_le_bytes(random_seed[0..8].try_into().unwrap());
+        
+        let mut winners_paid = 0;
+        
+        // Simple weighted selection based on tickets (multipliers)
+        while winners_paid < num_winners {
+            let winning_ticket = rand_val % game.total_tickets;
+            let mut current_ticket = 0;
+
+            for player in &game.participants {
+                current_ticket += *game.multipliers.get(player).unwrap() as u64;
+                if current_ticket > winning_ticket {
+                    Promise::new(player.clone()).transfer(reward_per_winner).detach();
+                    winners_paid += 1;
+                    break;
+                }
+            }
+            rand_val = rand_val.wrapping_add(1337); 
+        }
+
+        // Shift to Concluded so frontend can read it, but data is NOT deleted yet
+        game.state = GameState::Concluded;
     }
 
-    /*
-     * The functions below are read-only functions that can be called without a transaction (through
-     * JSON RPC query call). They read the data from the contract local storage and return the
-     * highest bid, auction end time, auctioneer, and claimed status
-     */
+    // ==========================================
+    // --- VIEW FUNCTIONS ---
+    // ==========================================
 
-    pub fn get_highest_bid(&self) -> Bid {
-        self.highest_bid.clone()
-    }
-
-    pub fn get_auction_end_time(&self) -> U64 {
-        self.auction_end_time.into()
-    }
-
-    pub fn get_auctioneer(&self) -> AccountId {
-        self.auctioneer.clone()
-    }
-
-    pub fn is_already_claimed(&self) -> bool {
-        self.is_claimed
-    }
-}
-
-/*
- * The rest of this file holds the inline tests for the code above
- * Learn more about Rust tests: https://doc.rust-lang.org/book/ch11-01-writing-tests.html
- */
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use near_sdk::json_types::U64;
-    use near_sdk::test_utils::{VMContextBuilder, accounts};
-    use near_sdk::{AccountId, testing_env};
-
-    fn get_context(predecessor_account_id: AccountId) -> VMContextBuilder {
-        let mut builder = VMContextBuilder::new();
-        builder
-            .current_account_id(accounts(0))
-            .signer_account_id(predecessor_account_id.clone())
-            .predecessor_account_id(predecessor_account_id);
-        builder
-    }
-
-    #[test]
-    fn init_contract() {
-        let end_time: U64 = U64::from(1000);
-        let alice: AccountId = "alice.near".parse().unwrap();
-        let contract = Contract::init(end_time, alice.clone());
-
-        let default_bid = contract.get_highest_bid();
-        assert_eq!(default_bid.bidder, env::current_account_id());
-        assert_eq!(default_bid.bid, NearToken::from_yoctonear(1));
-
-        let auction_end_time = contract.get_auction_end_time();
-        assert_eq!(auction_end_time, end_time);
-
-        let auctioneer = contract.get_auctioneer();
-        assert_eq!(auctioneer, alice);
-
-        assert!(!contract.is_already_claimed());
-    }
-
-    #[test]
-    fn bid_successfully() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let alice: AccountId = "alice.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp before auction end time
-        let mut context = get_context(alice.clone());
-        context.block_timestamp(500);
-        context.attached_deposit(NearToken::from_near(2));
-        testing_env!(context.build());
-
-        // Bid should succeed
-        let _ = contract.bid();
-
-        // Verify highest bid is updated
-        let highest_bid = contract.get_highest_bid();
-        assert_eq!(highest_bid.bidder, alice);
-        assert_eq!(highest_bid.bid, NearToken::from_near(2));
-    }
-
-    #[test]
-    #[should_panic(expected = "Auction has ended")]
-    fn bid_after_auction_ended() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let alice: AccountId = "alice.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp after auction end time
-        let mut context = get_context(alice.clone());
-        context.block_timestamp(2000);
-        context.attached_deposit(NearToken::from_near(2));
-        testing_env!(context.build());
-
-        // Bid should panic
-        let _ = contract.bid();
-    }
-
-    #[test]
-    #[should_panic(expected = "You must place a higher bid")]
-    fn bid_lower_than_current() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let alice: AccountId = "alice.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp before auction end time
-        let mut context = get_context(alice.clone());
-        context.block_timestamp(500);
-        // Default bid is 1 yoctoNEAR, so bidding with 0 or less should fail
-        // But we'll bid with the same amount (1 yoctoNEAR) which should also fail
-        context.attached_deposit(NearToken::from_yoctonear(1));
-        testing_env!(context.build());
-
-        // Bid should panic
-        let _ = contract.bid();
-    }
-
-    #[test]
-    fn claim_after_auction_ended() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp after auction end time
-        let mut context = get_context(auctioneer.clone());
-        context.block_timestamp(2000);
-        testing_env!(context.build());
-
-        // Claim should succeed
-        let _ = contract.claim();
-
-        // Verify auction is marked as claimed
-        assert!(contract.is_already_claimed());
-    }
-
-    #[test]
-    #[should_panic(expected = "Auction has not ended yet")]
-    fn claim_before_auction_ended() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp before auction end time
-        let mut context = get_context(auctioneer.clone());
-        context.block_timestamp(500);
-        testing_env!(context.build());
-
-        // Claim should panic
-        let _ = contract.claim();
-    }
-
-    #[test]
-    #[should_panic(expected = "Auction has already been claimed")]
-    fn claim_twice() {
-        let auctioneer: AccountId = "auctioneer.near".parse().unwrap();
-        let end_time: U64 = U64::from(1000);
-        let mut contract = Contract::init(end_time, auctioneer.clone());
-
-        // Set block_timestamp after auction end time
-        let mut context = get_context(auctioneer.clone());
-        context.block_timestamp(2000);
-        testing_env!(context.build());
-
-        // First claim should succeed
-        let _ = contract.claim();
-
-        // Second claim should panic
-        let _ = contract.claim();
+    pub fn get_game_state(&self, game_id: u64) -> Option<&Game> {
+        self.games.get(&game_id)
     }
 }
