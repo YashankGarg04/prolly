@@ -235,4 +235,20 @@ impl ProllyFactory {
     pub fn get_game_state(&self, game_id: u64) -> Option<&Game> {
         self.games.get(&game_id)
     }
+
+    pub fn get_games(&self, from_index: u64, limit: u64) -> Vec<Game> {
+    let keys: Vec<u64> = self.games.keys().cloned().collect();
+    let mut result = Vec::new();
+    
+    // Simple pagination to avoid gas limits
+    let start = from_index as usize;
+    let end = std::cmp::min(start + limit as usize, keys.len());
+    
+    for i in start..end {
+        if let Some(game) = self.games.get(&keys[i]) {
+            result.push(game.clone());
+        }
+    }
+    result
+}
 }
