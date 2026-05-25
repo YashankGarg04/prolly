@@ -1,6 +1,7 @@
-use near_sdk::{env, near, AccountId, Promise, PanicOnDefault, NearToken};
+use near_sdk::{env, near, AccountId, Promise, PanicOnDefault, NearToken, Gas};
 use near_sdk::json_types::U128;
 use std::collections::HashMap;
+const GAS_FOR_RESOLVE: Gas = Gas::from_tgas(50);
 
 // 1. The Strict State Machine
 #[near(serializers = [borsh, json])]
@@ -119,9 +120,14 @@ impl ProllyFactory {
         // Lock the game state to Drawing!
         game.state = GameState::Drawing;
 
-        // NOTE: In the final Mainnet version, this is where you call the NEAR Randomness Beacon.
-        // For this architecture test, we will simulate the callback succeeding immediately.
-        self.internal_resolve_winners(game_id);
+        // Schedule the callback to execute in the NEXT block for secure randomness
+        Promise::new(env::current_account_id())
+            .function_call(
+                "resolve_winners_callback".to_string(),
+                near_sdk::serde_json::to_vec(&near_sdk::serde_json::json!({ "game_id": game_id })).unwrap(),
+                NearToken::from_near(0),
+                GAS_FOR_RESOLVE,
+            );
     }
 
     // Admin emergency force closure
@@ -192,39 +198,50 @@ impl ProllyFactory {
     // ==========================================
 
     // This simulates the callback from the Randomness Beacon
-    fn internal_resolve_winners(&mut self, game_id: u64) {
-        let game = self.games.get_mut(&game_id).unwrap();
+    #[private] // Security: Only the contract itself can call this function
+    pub fn resolve_winners_callback(&mut self, game_id: u64) {
+        let game = self.games.get_mut(&game_id).expect("Game not found");
         
-        // 1 <= Winners <= Total / N
+        // Strict protection to ensure this only runs once
+        assert!(game.state == GameState::Drawing, "Game must be in Drawing state");
+
         let calculated_winners = game.total_tickets / game.n_variable;
         let num_winners = std::cmp::max(1, calculated_winners);
 
         let total_prize_pool = game.entry_fee.saturating_mul(game.total_tickets as u128);
         let reward_per_winner = total_prize_pool.saturating_div(num_winners as u128);
 
-        // Simulated Randomness
-        let random_seed = env::random_seed();
-        let mut rand_val = u64::from_le_bytes(random_seed[0..8].try_into().unwrap());
+        // 1. Gas Optimization: Build a prefix-sum array in memory (Fast O(N) one-time pass)
+        let mut cumulative_tickets = Vec::with_capacity(game.participants.len());
+        let mut current_sum = 0;
         
-        let mut winners_paid = 0;
-        
-        // Simple weighted selection based on tickets (multipliers)
-        while winners_paid < num_winners {
-            let winning_ticket = rand_val % game.total_tickets;
-            let mut current_ticket = 0;
-
-            for player in &game.participants {
-                current_ticket += *game.multipliers.get(player).unwrap() as u64;
-                if current_ticket > winning_ticket {
-                    Promise::new(player.clone()).transfer(reward_per_winner).detach();
-                    winners_paid += 1;
-                    break;
-                }
-            }
-            rand_val = rand_val.wrapping_add(1337); 
+        for player in &game.participants {
+            let tickets = *game.multipliers.get(player).unwrap() as u64;
+            current_sum += tickets;
+            cumulative_tickets.push(current_sum);
         }
 
-        // Shift to Concluded so frontend can read it, but data is NOT deleted yet
+        // 2. Secure Randomness Seed
+        let mut rand_bytes = env::random_seed_array();
+        let mut winners_paid = 0;
+        
+        // 3. Select winners using Binary Search (O(W log N) instead of O(W * N))
+        while winners_paid < num_winners {
+            let rand_val = u64::from_le_bytes(rand_bytes[0..8].try_into().unwrap());
+            let winning_ticket = rand_val % game.total_tickets;
+            
+            // Finds the exact index of the winner instantly
+            let winner_idx = cumulative_tickets.partition_point(|&x| x <= winning_ticket);
+            
+            let winner = &game.participants[winner_idx];
+            Promise::new(winner.clone()).transfer(reward_per_winner).detach();
+            winners_paid += 1;
+            
+            // Re-hash the bytes for the next winner iteration
+            rand_bytes = env::sha256_array(&rand_bytes); 
+        }
+
+        // Shift to Concluded so frontend can read it
         game.state = GameState::Concluded;
     }
 
